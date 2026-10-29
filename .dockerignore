@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.env
+dados/
+tests/
+scripts/
+documentos/
+*.md

@@ -1,7 +1,106 @@
+name: rag-distribuido
+
 services:
+
+  # ---- Mensageria: fila de indexacao ------------------------------------
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]   # fila sobrevive a reinicio
     ports: ["6379:6379"]
+    volumes:
+      - redis-dados:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
-  # TAREFA 4: acrescente aqui os tres servicos (ingestao, recuperacao, geracao)
-  # depois de escrever um Dockerfile para cada um.
+  # ---- Servico 1: ingestao (API) ----------------------------------------
+  ingestao:
+    build:
+      context: .
+      dockerfile: servicos/ingestao/Dockerfile
+    ports: ["8001:8001"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DADOS_DIR: /dados
+    volumes:
+      - indice:/dados
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/saude', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---- Servico 1: ingestao (worker que consome a fila) -------------------
+  # Mesma imagem da API, outro comando. Compartilha o volume do indice.
+  ingestao-worker:
+    build:
+      context: .
+      dockerfile: servicos/ingestao/Dockerfile
+    command: ["python", "-m", "servicos.ingestao.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DADOS_DIR: /dados
+    volumes:
+      - indice:/dados
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Servico 2: recuperacao -------------------------------------------
+  recuperacao:
+    build:
+      context: .
+      dockerfile: servicos/recuperacao/Dockerfile
+    ports: ["8002:8002"]
+    environment:
+      URL_INGESTAO: http://ingestao:8001
+      SCORE_MINIMO: ${SCORE_MINIMO:-0.0}
+    depends_on:
+      ingestao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8002/saude', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---- Servico 3: geracao (chama o LLM protegido) -----------------------
+  geracao:
+    build:
+      context: .
+      dockerfile: servicos/geracao/Dockerfile
+    ports: ["8003:8003"]
+    environment:
+      URL_RECUPERACAO: http://recuperacao:8002
+      # a chave vem do .env / ambiente; vazia = modo simulado. NUNCA no codigo.
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_API_URL: ${LLM_API_URL:-https://api.openai.com/v1/chat/completions}
+      LLM_MODELO: ${LLM_MODELO:-gpt-4o-mini}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-10}
+      LLM_TENTATIVAS: ${LLM_TENTATIVAS:-3}
+      DISJUNTOR_LIMITE: ${DISJUNTOR_LIMITE:-3}
+      DISJUNTOR_ESPERA: ${DISJUNTOR_ESPERA:-20}
+    depends_on:
+      recuperacao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/saude', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  redis-dados:
+  indice:

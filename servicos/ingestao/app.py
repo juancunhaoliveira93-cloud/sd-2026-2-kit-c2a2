@@ -1,50 +1,68 @@
 """
 Servico 1 - INGESTAO: recebe documentos, gera embeddings e armazena.
 
-JA PRONTO: indexacao em memoria e a rota de status.
-TAREFA 1: persistir o indice em disco para nao perder ao reiniciar.
+Fluxo:  POST /indexar  ->  publica na FILA (Redis)  ->  worker indexa
+        (servicos/ingestao/worker.py)  ->  grava em disco (armazenamento.py)
+
+Se o Redis estiver fora do ar, a API NAO quebra: indexa na hora, de forma
+sincrona (degradacao elegante).
 
 Rodar: uvicorn servicos.ingestao.app:app --port 8001
 """
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from servicos.comum.embeddings import Vetorizador
+from servicos.ingestao import armazenamento, fila
 
 app = FastAPI(title="Ingestao - C2.A2")
 
-vetorizador = Vetorizador()
-INDICE = []
-
 
 class Documento(BaseModel):
-    texto: str
+    texto: str = Field(min_length=1)
     origem: str = "desconhecida"
 
 
 @app.post("/indexar")
 def indexar(docs: list[Documento]):
-    textos = [d.texto for d in docs]
-    vetorizador.ajustar([d["texto"] for d in INDICE] + textos or textos)
-    INDICE.clear()
-    # reindexa tudo com o vocabulario novo
-    for d in docs:
-        INDICE.append({"texto": d.texto, "origem": d.origem})
-    for item in INDICE:
-        item["vetor"] = vetorizador.vetorizar(item["texto"])
-    return {"indexados": len(INDICE)}
+    if not docs:
+        raise HTTPException(status_code=422, detail="envie ao menos um documento")
+    carga = [d.model_dump() for d in docs]
+
+    try:
+        fila.publicar(carga)
+    except fila.FilaIndisponivel:
+        # Contingencia: sem fila, indexa direto.
+        try:
+            total = armazenamento.adicionar(carga)
+        except ValueError as erro:
+            raise HTTPException(status_code=422, detail=str(erro))
+        return JSONResponse(
+            status_code=200,
+            content={"modo": "sincrono (fila indisponivel)", "indexados": total},
+        )
+
+    return JSONResponse(
+        status_code=202,
+        content={"modo": "assincrono", "enfileirados": len(carga)},
+    )
 
 
 @app.get("/indice")
 def indice():
     """Consumido pelo servico de recuperacao."""
-    return {"total": len(INDICE),
-            "itens": [{"texto": i["texto"], "origem": i["origem"],
-                       "vetor": i["vetor"]} for i in INDICE]}
+    itens = armazenamento.listar()
+    return {
+        "total": len(itens),
+        "itens": [{"texto": i["texto"], "origem": i["origem"], "vetor": i["vetor"]}
+                  for i in itens],
+    }
 
 
 @app.get("/saude")
 def saude():
-    return {"status": "ok", "documentos": len(INDICE)}
-
-# TAREFA 1: persistir o indice (arquivo ou banco vetorial).
+    return {
+        "status": "ok",
+        "documentos": armazenamento.total(),
+        "fila": fila.estado(),
+    }

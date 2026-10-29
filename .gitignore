@@ -9,3 +9,6 @@ venv/
 *_pb2_grpc.py
 .pytest_cache/
 .DS_Store
+
+# indice vetorial persistido (gerado em tempo de execucao)
+dados/

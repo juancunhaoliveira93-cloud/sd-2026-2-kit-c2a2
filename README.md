@@ -74,7 +74,7 @@ flowchart LR
 | Recuperação | 8002 | `POST /buscar` | `{"pergunta","top_k"}` → trechos com `origem` e `score` |
 | | | `GET /saude` | Status |
 | Geração | 8003 | `POST /perguntar` | `{"pergunta"}` → `resposta`, `contexto`, `fontes` |
-| | | `GET /saude` | Status e estado do disjuntor |
+| | | `GET /saude` | Status e estado dos dois disjuntores (LLM e recuperação) |
 
 ## Resiliência na chamada ao LLM
 
@@ -82,7 +82,8 @@ flowchart LR
 |---|---|---|
 | **Tempo-limite** | cada tentativa expira | `LLM_TIMEOUT` (padrão 20s no código; 10s no compose) |
 | **Retentativa** com backoff exponencial | `servicos/geracao/resiliencia.py` | `LLM_TENTATIVAS` (3) — só para erros passageiros (timeout, conexão, HTTP 429/5xx) |
-| **Circuit breaker** | `servicos/comum/circuit_breaker.py` | `DISJUNTOR_LIMITE` (3 falhas), `DISJUNTOR_ESPERA` (20s) |
+| **Circuit breaker (LLM)** | `servicos/comum/circuit_breaker.py` | `DISJUNTOR_LIMITE` (3 falhas), `DISJUNTOR_ESPERA` (20s) |
+| **Circuit breaker (recuperação)** | mesmo código, instância independente | `DISJUNTOR_REC_LIMITE` (3 falhas), `DISJUNTOR_REC_ESPERA` (10s) |
 
 A retentativa fica **dentro** do disjuntor: uma pergunta que esgotou todas as tentativas conta
 como **uma** falha para o circuito. Depois de 3 perguntas falhas o circuito **abre** e as
@@ -91,7 +92,8 @@ tempo de espera, o circuito fica *meio-aberto* e deixa passar uma chamada de tes
 
 **Degradação elegante:** quando o LLM falha (`502`) ou o circuito está aberto (`503`), o corpo
 da resposta ainda traz o `contexto` e as `fontes` recuperados. Se a recuperação cair, a geração
-responde `503` com mensagem clara. Se não houver trecho relevante, responde que não encontrou
+responde `503` com mensagem clara e, depois de 3 falhas, o **disjuntor da recuperação abre** e as
+seguintes recebem `503` imediato com `Retry-After`. Os dois disjuntores são independentes. Se não houver trecho relevante, responde que não encontrou
 a informação, **sem gastar chamada ao LLM**.
 
 Outras proteções: mensagens inválidas da fila vão para uma *dead-letter* (`fila:indexacao:erros`)
@@ -157,8 +159,10 @@ python scripts/teste_e2e.py                # fluxo completo (sistema rodando)
 # Redis cai -> /indexar passa a indexar de forma síncrona (200), sem quebrar
 docker compose stop redis
 
-# Recuperação cai -> /perguntar responde 503 com mensagem clara
+# Recuperação cai -> 503 (3x); depois o disjuntor abre e o 503 passa a ser imediato
 docker compose stop recuperacao
+curl localhost:8003/saude        # "disjuntor_recuperacao":"aberto"
+# docker compose start recuperacao  -> em ~10s o circuito fecha sozinho
 
 # LLM inalcançável (equivale a desligar a internet): 502, 502, 502 e depois 503 imediato
 LLM_API_KEY=x LLM_API_URL=http://127.0.0.1:9 docker compose up -d --force-recreate geracao

@@ -60,6 +60,7 @@ class TesteDisjuntorNoEndpoint(unittest.TestCase):
 
     def setUp(self):
         geracao.disjuntor = CircuitBreaker(limite_falhas=3, espera_segundos=60)
+        geracao.disjuntor_recuperacao = CircuitBreaker(limite_falhas=3, espera_segundos=60)
         for alvo, valor in [
             ("servicos.geracao.app.requests.post",
              mock.Mock(return_value=mock.Mock(json=lambda: TRECHOS,
@@ -103,6 +104,43 @@ class TesteDisjuntorNoEndpoint(unittest.TestCase):
     def test_recuperacao_fora_do_ar_devolve_503(self):
         geracao.requests.post.side_effect = requests.ConnectionError()
         self.assertEqual(geracao.perguntar(self.pergunta).status_code, 503)
+
+    def test_disjuntor_da_recuperacao_abre_e_recusa_na_hora(self):
+        geracao.requests.post.side_effect = requests.ConnectionError()
+        for _ in range(3):
+            r = geracao.perguntar(self.pergunta)
+            self.assertEqual(r.status_code, 503)
+            self.assertEqual(conteudo(r)["erro"], "servico de recuperacao indisponivel")
+        self.assertEqual(geracao.disjuntor_recuperacao.estado, "aberto")
+        chamadas_antes = geracao.requests.post.call_count
+
+        # circuito aberto: 503 imediato, SEM tentar a recuperacao, com Retry-After
+        r = geracao.perguntar(self.pergunta)
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("circuit breaker aberto", conteudo(r)["erro"])
+        self.assertEqual(conteudo(r)["disjuntor"], "aberto")
+        self.assertIn("retry-after", r.headers)
+        self.assertEqual(geracao.requests.post.call_count, chamadas_antes)
+
+    def test_disjuntores_sao_independentes(self):
+        geracao.requests.post.side_effect = requests.ConnectionError()
+        for _ in range(3):
+            geracao.perguntar(self.pergunta)
+        self.assertEqual(geracao.disjuntor_recuperacao.estado, "aberto")
+        self.assertEqual(geracao.disjuntor.estado, "fechado")   # o do LLM nao foi afetado
+
+    def test_recuperacao_volta_e_o_disjuntor_fecha(self):
+        geracao.disjuntor_recuperacao = CircuitBreaker(limite_falhas=3, espera_segundos=0)
+        geracao.requests.post.side_effect = requests.ConnectionError()
+        for _ in range(3):
+            geracao.perguntar(self.pergunta)
+        self.assertEqual(geracao.disjuntor_recuperacao.estado, "aberto")
+
+        geracao.requests.post.side_effect = None            # recuperacao voltou
+        with mock.patch("servicos.geracao.app.gerar", return_value="ok"):
+            r = geracao.perguntar(self.pergunta)             # meio-aberto -> sucesso
+        self.assertEqual(r["resposta"], "ok")
+        self.assertEqual(geracao.disjuntor_recuperacao.estado, "fechado")
 
 
 if __name__ == "__main__":

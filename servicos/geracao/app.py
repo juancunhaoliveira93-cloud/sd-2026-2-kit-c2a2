@@ -6,6 +6,10 @@ TAREFA 3: a chamada ao LLM e protegida por TRES mecanismos:
   - retentativa   : erros passageiros sao repetidos com backoff (resiliencia.py)
   - circuit breaker: depois de falhas seguidas, para de chamar o LLM por um tempo
 
+A chamada ao servico de RECUPERACAO tem seu proprio circuit breaker (independente
+do do LLM): se a recuperacao cair, o circuito abre e as proximas perguntas
+recebem 503 na hora, sem esperar timeout.
+
 Se o LLM estiver fora, o servico NAO quebra: responde 502/503 com mensagem
 clara e devolve os trechos recuperados, para o cliente ao menos ver as fontes.
 
@@ -38,31 +42,49 @@ disjuntor = CircuitBreaker(
 )
 
 
+ESPERA_DISJUNTOR_REC = int(os.getenv("DISJUNTOR_REC_ESPERA", "10"))
+disjuntor_recuperacao = CircuitBreaker(
+    limite_falhas=int(os.getenv("DISJUNTOR_REC_LIMITE", "3")),
+    espera_segundos=ESPERA_DISJUNTOR_REC,
+)
+
+
 class Pergunta(BaseModel):
     pergunta: str = Field(min_length=1)
 
 
-def _erro(status, mensagem, contexto, fontes, headers=None):
+def _erro(status, mensagem, contexto, fontes, headers=None, estado=None):
     return JSONResponse(
         status_code=status,
-        content={"erro": mensagem, "disjuntor": disjuntor.estado,
+        content={"erro": mensagem, "disjuntor": estado or disjuntor.estado,
                  "contexto": contexto, "fontes": fontes},
         headers=headers,
     )
+
+
+def _buscar_trechos(pergunta):
+    """Chamada REST ao servico de recuperacao (protegida pelo disjuntor_recuperacao)."""
+    r = requests.post(f"{URL_RECUPERACAO}/buscar",
+                      json={"pergunta": pergunta, "top_k": TOP_K},
+                      timeout=TIMEOUT_RECUPERACAO)
+    r.raise_for_status()
+    return r.json()["resultados"]
 
 
 @app.post("/perguntar")
 def perguntar(p: Pergunta):
     # 1) RECUPERACAO: trechos mais relevantes (chamada REST ao servico 2)
     try:
-        r = requests.post(f"{URL_RECUPERACAO}/buscar",
-                          json={"pergunta": p.pergunta, "top_k": TOP_K},
-                          timeout=TIMEOUT_RECUPERACAO)
-        r.raise_for_status()
-        resultados = r.json()["resultados"]
-    except requests.RequestException as erro:
+        resultados = disjuntor_recuperacao.chamar(_buscar_trechos, p.pergunta)
+    except CircuitoAberto:
+        return _erro(503, "servico de recuperacao temporariamente indisponivel "
+                          "(circuit breaker aberto); tente novamente em instantes",
+                     [], [], headers={"Retry-After": str(ESPERA_DISJUNTOR_REC)},
+                     estado=disjuntor_recuperacao.estado)
+    except (requests.RequestException, KeyError, ValueError) as erro:
         log.error("recuperacao indisponivel: %s", erro)
-        return _erro(503, "servico de recuperacao indisponivel", [], [])
+        return _erro(503, "servico de recuperacao indisponivel", [], [],
+                     estado=disjuntor_recuperacao.estado)
 
     contexto = [t["texto"] for t in resultados]
     fontes = sorted({t["origem"] for t in resultados})
@@ -91,4 +113,5 @@ def perguntar(p: Pergunta):
 
 @app.get("/saude")
 def saude():
-    return {"status": "ok", "disjuntor": disjuntor.estado}
+    return {"status": "ok", "disjuntor": disjuntor.estado,
+            "disjuntor_recuperacao": disjuntor_recuperacao.estado}

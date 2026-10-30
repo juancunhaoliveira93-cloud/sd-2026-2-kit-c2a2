@@ -1,41 +1,92 @@
 """
 Servico 3 - GERACAO: monta o prompt com o contexto e chama o LLM.
 
-TAREFA 3: proteger a chamada ao LLM com o circuit breaker.
+TAREFA 3: a chamada ao LLM e protegida por TRES mecanismos:
+  - tempo-limite  : cada tentativa expira (LLM_TIMEOUT, em comum/llm.py)
+  - retentativa   : erros passageiros sao repetidos com backoff (resiliencia.py)
+  - circuit breaker: depois de falhas seguidas, para de chamar o LLM por um tempo
+
+Se o LLM estiver fora, o servico NAO quebra: responde 502/503 com mensagem
+clara e devolve os trechos recuperados, para o cliente ao menos ver as fontes.
 
 Rodar: uvicorn servicos.geracao.app:app --port 8003
 """
+import logging
 import os
 
 import requests
 from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from servicos.comum.circuit_breaker import CircuitBreaker, CircuitoAberto
 from servicos.comum.llm import gerar
+from servicos.geracao.resiliencia import com_retentativa
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("geracao")
 
 app = FastAPI(title="Geracao - C2.A2")
 URL_RECUPERACAO = os.getenv("URL_RECUPERACAO", "http://localhost:8002")
+TIMEOUT_RECUPERACAO = float(os.getenv("TIMEOUT_RECUPERACAO", "10"))
+TOP_K = int(os.getenv("TOP_K", "3"))
 
-disjuntor = CircuitBreaker(limite_falhas=3, espera_segundos=20)
+ESPERA_DISJUNTOR = int(os.getenv("DISJUNTOR_ESPERA", "20"))
+disjuntor = CircuitBreaker(
+    limite_falhas=int(os.getenv("DISJUNTOR_LIMITE", "3")),
+    espera_segundos=ESPERA_DISJUNTOR,
+)
 
 
 class Pergunta(BaseModel):
-    pergunta: str
+    pergunta: str = Field(min_length=1)
+
+
+def _erro(status, mensagem, contexto, fontes, headers=None):
+    return JSONResponse(
+        status_code=status,
+        content={"erro": mensagem, "disjuntor": disjuntor.estado,
+                 "contexto": contexto, "fontes": fontes},
+        headers=headers,
+    )
 
 
 @app.post("/perguntar")
 def perguntar(p: Pergunta):
-    r = requests.post(f"{URL_RECUPERACAO}/buscar",
-                      json={"pergunta": p.pergunta, "top_k": 3}, timeout=10)
-    r.raise_for_status()
-    contexto = [t["texto"] for t in r.json()["resultados"]]
+    # 1) RECUPERACAO: trechos mais relevantes (chamada REST ao servico 2)
+    try:
+        r = requests.post(f"{URL_RECUPERACAO}/buscar",
+                          json={"pergunta": p.pergunta, "top_k": TOP_K},
+                          timeout=TIMEOUT_RECUPERACAO)
+        r.raise_for_status()
+        resultados = r.json()["resultados"]
+    except requests.RequestException as erro:
+        log.error("recuperacao indisponivel: %s", erro)
+        return _erro(503, "servico de recuperacao indisponivel", [], [])
 
-    # TAREFA 3: envolva a chamada gerar(...) com disjuntor.chamar(...)
-    # e trate CircuitoAberto devolvendo 503 com mensagem clara.
-    resposta = gerar(p.pergunta, contexto)
+    contexto = [t["texto"] for t in resultados]
+    fontes = sorted({t["origem"] for t in resultados})
 
-    return {"pergunta": p.pergunta, "resposta": resposta, "contexto": contexto}
+    # Nada relevante nos documentos: nao gasta chamada de LLM nem inventa resposta.
+    if not contexto:
+        return {"pergunta": p.pergunta,
+                "resposta": "Nao encontrei essa informacao nos documentos indexados.",
+                "contexto": [], "fontes": []}
+
+    # 2) GERACAO: LLM protegido por circuit breaker + retentativa + timeout
+    try:
+        resposta = disjuntor.chamar(com_retentativa, gerar, p.pergunta, contexto)
+    except CircuitoAberto:
+        return _erro(503, "LLM temporariamente indisponivel (circuit breaker aberto); "
+                          "tente novamente em instantes", contexto, fontes,
+                     headers={"Retry-After": str(ESPERA_DISJUNTOR)})
+    except Exception as erro:
+        log.error("LLM falhou apos retentativas: %s", erro)
+        return _erro(502, f"falha ao consultar o LLM: {type(erro).__name__}",
+                     contexto, fontes)
+
+    return {"pergunta": p.pergunta, "resposta": resposta,
+            "contexto": contexto, "fontes": fontes}
 
 
 @app.get("/saude")
